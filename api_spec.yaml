@@ -1,0 +1,2546 @@
+openapi: "3.1.0"
+
+# ============================================================
+# OSCS API Specification
+# System: Outpatient Patient Scheduling & Care System (OSCS)
+# Owner: ABC Health Care Company
+# PRD Version: 1.0 (December 20, 2025)
+# API Spec Version: 1.0.0
+#
+# PURPOSE: This specification covers every HTTP endpoint implied
+# by the OSCS PRD functional requirements (FR-001 through FR-704)
+# and non-functional requirements (NFR Security, Privacy, Performance).
+#
+# DESIGN NOTES:
+# - All endpoints that handle PHI require JWT bearer auth.
+# - All PHI-touching endpoints are audit-logged server-side.
+# - RBAC enforcement is applied at the API gateway / middleware layer,
+#   not solely at the UI layer.
+# - Pagination uses cursor-based pagination (page/limit) for stability.
+# - Error responses follow RFC 7807 Problem Details format.
+# ============================================================
+
+info:
+  title: "OSCS - Outpatient Patient Scheduling & Care System API"
+  version: "1.0.0"
+  description: |
+    REST API for ABC Health Care Company's Outpatient Patient Scheduling
+    & Care System (OSCS). Covers patient portal, scheduling, care management,
+    communications, reporting, administration, and EHR integration endpoints.
+
+    **Security:** All endpoints except /auth/register and /auth/login require
+    a valid JWT bearer token. Staff-facing endpoints additionally enforce
+    role-based access control (RBAC). PHI-relevant actions are audit logged.
+
+    **PRD Reference:** PRD v1.0, December 20, 2025.
+  contact:
+    name: "ABC Health Care IT"
+    email: "oscs-api@abchealthcare.example.com"
+  license:
+    name: "Proprietary - ABC Health Care Company"
+
+servers:
+  - url: "https://api.oscs.abchealthcare.example.com/v1"
+    description: "Production"
+  - url: "https://api-staging.oscs.abchealthcare.example.com/v1"
+    description: "Staging"
+
+# ============================================================
+# SECURITY SCHEMES
+# PRD Ref: Section 2 (Access model), Section 7 (NFR Security)
+# ============================================================
+components:
+  securitySchemes:
+
+    # JWT bearer token issued at /auth/login.
+    # Staff tokens include role claims used for RBAC enforcement.
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT issued on successful authentication. Payload includes:
+        sub (user ID), role (RBAC role), exp (expiry), jti (unique token ID).
+        All PHI-bearing requests must include this token.
+
+  # ============================================================
+  # REUSABLE SCHEMAS
+  # ============================================================
+  schemas:
+
+    # ---- Error (RFC 7807 Problem Details) -------------------
+    # Consistent error format across all endpoints.
+    # 'code' is a machine-readable enum for programmatic handling.
+    ProblemDetail:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          description: "URI identifying the error type."
+          example: "https://api.oscs.abchealthcare.example.com/errors/slot-unavailable"
+        title:
+          type: string
+          description: "Short human-readable summary."
+          example: "Slot Unavailable"
+        status:
+          type: integer
+          description: "HTTP status code."
+          example: 409
+        code:
+          type: string
+          description: "Machine-readable error code."
+          example: "SLOT_UNAVAILABLE"
+        detail:
+          type: string
+          description: "Human-readable explanation specific to this occurrence."
+
+    # ---- Patient (FR-001, FR-002) ---------------------------
+    # PHI entity — all fields encrypted at rest.
+    Patient:
+      type: object
+      required: [id, firstName, lastName, dateOfBirth, contactEmail]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: "OSCS-assigned patient identifier (UUID)."
+        firstName:
+          type: string
+          description: "Patient's legal first name (PHI)."
+        lastName:
+          type: string
+          description: "Patient's legal last name (PHI)."
+        dateOfBirth:
+          type: string
+          format: date
+          description: "Date of birth in ISO 8601 format (PHI)."
+          example: "1985-03-15"
+        contactEmail:
+          type: string
+          format: email
+          description: "Primary email (PHI)."
+        contactPhone:
+          type: string
+          description: "Mobile phone for SMS notifications (PHI). E.164 format."
+          example: "+15551234567"
+        preferredLanguage:
+          type: string
+          description: "BCP-47 language code for portal UI and notifications."
+          example: "en"
+        address:
+          $ref: "#/components/schemas/Address"
+        emergencyContact:
+          $ref: "#/components/schemas/EmergencyContact"
+        notificationPreferences:
+          $ref: "#/components/schemas/NotificationPreferences"
+        ehrPatientId:
+          type: string
+          description: "Cross-reference ID in the external EHR/EMR (FR-701)."
+
+    # ---- Address --------------------------------------------
+    Address:
+      type: object
+      properties:
+        line1:
+          type: string
+        line2:
+          type: string
+        city:
+          type: string
+        state:
+          type: string
+        postalCode:
+          type: string
+        country:
+          type: string
+          default: "US"
+
+    # ---- EmergencyContact (FR-002) -------------------------
+    EmergencyContact:
+      type: object
+      properties:
+        name:
+          type: string
+        relationship:
+          type: string
+        phone:
+          type: string
+          description: "E.164 format."
+
+    # ---- NotificationPreferences (FR-401) ------------------
+    # Opt-in/opt-out stored and enforced per FR-401.
+    NotificationPreferences:
+      type: object
+      properties:
+        smsOptIn:
+          type: boolean
+          default: true
+        emailOptIn:
+          type: boolean
+          default: true
+        reminderLeadTimesHours:
+          type: array
+          items:
+            type: integer
+          description: "Hours before appointment when reminders are sent. Configurable per patient."
+          example: [72, 24]
+
+    # ---- Appointment (FR-108) -------------------------------
+    # Lifecycle states: Requested, Scheduled, Confirmed,
+    # Checked-in, In-room, Completed, Cancelled, No-show.
+    Appointment:
+      type: object
+      required: [id, patientId, providerId, locationId, visitTypeId, startDatetime, endDatetime, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        patientId:
+          type: string
+          format: uuid
+          description: "Reference to Patient.id (PHI)."
+        providerId:
+          type: string
+          format: uuid
+          description: "Reference to Provider.id."
+        locationId:
+          type: string
+          format: uuid
+        visitTypeId:
+          type: string
+          format: uuid
+        startDatetime:
+          type: string
+          format: date-time
+          description: "ISO 8601 with timezone."
+        endDatetime:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum:
+            - Requested
+            - Scheduled
+            - Confirmed
+            - Checked-in
+            - In-room
+            - Completed
+            - Cancelled
+            - No-show
+          description: "Appointment lifecycle state per FR-108. State transitions are validated and audited."
+        isOverbooked:
+          type: boolean
+          default: false
+          description: "True when this appointment was booked beyond normal capacity (FR-106)."
+        overbookJustification:
+          type: string
+          description: "Required when isOverbooked=true. Audit logged (FR-106)."
+        cancellationReasonCode:
+          type: string
+          description: "Structured cancellation reason code (FR-004)."
+        cancellationReasonText:
+          type: string
+          description: "Optional free-text cancellation reason (FR-004)."
+        reservedResources:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResourceRef"
+          description: "Rooms and equipment reserved for this appointment (FR-104)."
+        teleHealthMeetingLink:
+          type: string
+          format: uri
+          description: "Generated meeting link for tele-visit types (FR-703)."
+
+    # ---- AvailabilitySlot (FR-003, FR-102, FR-103) ----------
+    # Represents a bookable time slot returned by the availability search.
+    AvailabilitySlot:
+      type: object
+      required: [slotId, providerId, locationId, visitTypeId, startDatetime, endDatetime]
+      properties:
+        slotId:
+          type: string
+          format: uuid
+          description: "Transient ID used to reserve this slot at booking."
+        providerId:
+          type: string
+          format: uuid
+        providerDisplayName:
+          type: string
+          description: "Provider's display name for the patient-facing portal."
+        locationId:
+          type: string
+          format: uuid
+        locationName:
+          type: string
+        visitTypeId:
+          type: string
+          format: uuid
+        startDatetime:
+          type: string
+          format: date-time
+        endDatetime:
+          type: string
+          format: date-time
+
+    # ---- Provider (FR-101, FR-601) --------------------------
+    Provider:
+      type: object
+      required: [id, firstName, lastName, specialtyId]
+      properties:
+        id:
+          type: string
+          format: uuid
+        firstName:
+          type: string
+        lastName:
+          type: string
+        credentials:
+          type: string
+          description: "e.g., MD, DO, NP, PA"
+          example: "MD"
+        specialtyId:
+          type: string
+          format: uuid
+        locationIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: "Locations where this provider practices."
+        ehrProviderId:
+          type: string
+          description: "Cross-reference to EHR provider record (FR-701)."
+
+    # ---- Location (FR-102, FR-601) -------------------------
+    Location:
+      type: object
+      required: [id, name, address]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        address:
+          $ref: "#/components/schemas/Address"
+        operatingHours:
+          type: array
+          items:
+            $ref: "#/components/schemas/OperatingHoursEntry"
+        holidayDates:
+          type: array
+          items:
+            type: string
+            format: date
+        geoFenceRadiusMeters:
+          type: integer
+          description: "Optional geo-fence radius for mobile self check-in (FR-202)."
+
+    # ---- OperatingHoursEntry --------------------------------
+    OperatingHoursEntry:
+      type: object
+      properties:
+        dayOfWeek:
+          type: string
+          enum: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]
+        openTime:
+          type: string
+          description: "HH:MM (24h) local time."
+          example: "08:00"
+        closeTime:
+          type: string
+          example: "17:00"
+
+    # ---- VisitType (FR-103) --------------------------------
+    VisitType:
+      type: object
+      required: [id, name, defaultDurationMinutes, bookingChannels]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: "Annual Wellness Visit"
+        defaultDurationMinutes:
+          type: integer
+          example: 30
+        requiredResourceTypes:
+          type: array
+          items:
+            type: string
+          description: "Resource types required for this visit (e.g., 'exam-room', 'ecg-machine')."
+        prerequisites:
+          type: array
+          items:
+            type: string
+          description: "Pre-conditions that must be met before booking (e.g., 'lab-completed')."
+        bookingChannels:
+          type: array
+          items:
+            type: string
+            enum: [patient-self-scheduling, staff]
+          description: "Who can book this visit type. 'staff' only = not visible in patient portal (FR-103)."
+        constraints:
+          $ref: "#/components/schemas/SchedulingConstraints"
+
+    # ---- SchedulingConstraints (FR-107) --------------------
+    SchedulingConstraints:
+      type: object
+      description: "Eligibility rules enforced before a booking is accepted (FR-107)."
+      properties:
+        allowedPatientType:
+          type: string
+          enum: [new, established, any]
+          default: any
+        minAgeYears:
+          type: integer
+        maxAgeYears:
+          type: integer
+        requiresReferral:
+          type: boolean
+          default: false
+        acceptedInsuranceCodes:
+          type: array
+          items:
+            type: string
+          description: "Empty array means all insurance accepted."
+
+    # ---- ResourceRef (FR-104) ------------------------------
+    ResourceRef:
+      type: object
+      properties:
+        resourceId:
+          type: string
+          format: uuid
+        resourceType:
+          type: string
+          enum: [room, equipment, staff]
+        resourceName:
+          type: string
+
+    # ---- WaitlistEntry (FR-105) ----------------------------
+    WaitlistEntry:
+      type: object
+      required: [id, patientId, visitTypeId]
+      properties:
+        id:
+          type: string
+          format: uuid
+        patientId:
+          type: string
+          format: uuid
+        visitTypeId:
+          type: string
+          format: uuid
+        preferredProviderIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: "Patient's preferred providers; empty means any."
+        preferredLocationIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+        preferredTimeWindows:
+          type: array
+          items:
+            $ref: "#/components/schemas/TimeWindow"
+        priorityOrder:
+          type: integer
+          description: "System-assigned priority position in the waitlist."
+        status:
+          type: string
+          enum: [active, offered, accepted, expired, removed]
+
+    # ---- TimeWindow ----------------------------------------
+    TimeWindow:
+      type: object
+      properties:
+        startDate:
+          type: string
+          format: date
+        endDate:
+          type: string
+          format: date
+        preferredDaysOfWeek:
+          type: array
+          items:
+            type: string
+            enum: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]
+
+    # ---- IntakeForm (FR-005, FR-602) -----------------------
+    IntakeForm:
+      type: object
+      required: [id, name, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        version:
+          type: integer
+          description: "Template version. Form responses reference this version (FR-602)."
+        effectiveDate:
+          type: string
+          format: date
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/FormField"
+        requiresESignature:
+          type: boolean
+          default: false
+          description: "True if this is a consent document requiring e-signature (FR-005)."
+
+    # ---- FormField -----------------------------------------
+    FormField:
+      type: object
+      required: [fieldId, label, type, required]
+      properties:
+        fieldId:
+          type: string
+        label:
+          type: string
+        type:
+          type: string
+          enum: [text, textarea, date, boolean, select, multi-select, signature]
+        required:
+          type: boolean
+        options:
+          type: array
+          items:
+            type: string
+          description: "Options for select/multi-select fields."
+
+    # ---- FormResponse (FR-005) -----------------------------
+    # Immutable once submitted; version-linked to the form template.
+    FormResponse:
+      type: object
+      required: [id, appointmentId, formId, formVersion, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        appointmentId:
+          type: string
+          format: uuid
+        formId:
+          type: string
+          format: uuid
+        formVersion:
+          type: integer
+        status:
+          type: string
+          enum: [draft, submitted]
+          description: "Submitted responses are immutable (FR-005)."
+        submittedAt:
+          type: string
+          format: date-time
+        responses:
+          type: object
+          additionalProperties: true
+          description: "Map of fieldId -> patient response value (PHI — encrypted at rest)."
+        signatureData:
+          type: string
+          format: byte
+          description: "Base64-encoded signature image (FR-005). Present when form requiresESignature=true."
+        signedAt:
+          type: string
+          format: date-time
+
+    # ---- CarePlan (FR-301) ---------------------------------
+    CarePlan:
+      type: object
+      required: [id, patientId, encounterId, createdByUserId]
+      properties:
+        id:
+          type: string
+          format: uuid
+        patientId:
+          type: string
+          format: uuid
+        encounterId:
+          type: string
+          format: uuid
+          description: "The encounter/visit this care plan is tied to (FR-301)."
+        createdByUserId:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        goals:
+          type: array
+          items:
+            type: string
+          description: "Clinical goals for this care period."
+        interventions:
+          type: array
+          items:
+            type: string
+          description: "Planned interventions."
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Task"
+
+    # ---- Task (FR-302) ------------------------------------
+    Task:
+      type: object
+      required: [id, title, ownerId, dueDate, priority, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        carePlanId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        ownerId:
+          type: string
+          format: uuid
+          description: "User or patient assigned to this task."
+        ownerType:
+          type: string
+          enum: [patient, staff]
+        dueDate:
+          type: string
+          format: date
+        priority:
+          type: string
+          enum: [high, medium, low]
+        status:
+          type: string
+          enum: [open, in-progress, completed, cancelled, overdue]
+
+    # ---- Message (FR-402) ---------------------------------
+    # All messages with PHI stored encrypted at rest and audited.
+    Message:
+      type: object
+      required: [id, senderId, senderType, body]
+      properties:
+        id:
+          type: string
+          format: uuid
+        patientId:
+          type: string
+          format: uuid
+          description: "Patient this message relates to."
+        senderId:
+          type: string
+          format: uuid
+        senderType:
+          type: string
+          enum: [patient, staff, system]
+        recipientId:
+          type: string
+          format: uuid
+        body:
+          type: string
+          description: "Message body. May contain PHI — encrypted at rest, accessible only by authorized roles."
+        channel:
+          type: string
+          enum: [sms, email, portal, internal]
+        sentAt:
+          type: string
+          format: date-time
+        deliveryStatus:
+          type: string
+          enum: [pending, sent, delivered, failed]
+
+    # ---- AuditLog (FR-603) --------------------------------
+    # Read-only. Immutable. No DELETE or PUT endpoint exposed.
+    AuditLog:
+      type: object
+      required: [id, entityType, entityId, action, actorId, actorRole, timestamp]
+      properties:
+        id:
+          type: string
+          format: uuid
+        entityType:
+          type: string
+          description: "e.g., Appointment, Patient, CarePlan, Task, Permission."
+        entityId:
+          type: string
+          format: uuid
+        action:
+          type: string
+          enum: [create, update, delete, state-transition, export, login, login-failed, logout, overbook]
+        actorId:
+          type: string
+          format: uuid
+          description: "User who performed the action."
+        actorRole:
+          type: string
+          description: "RBAC role of the actor at time of action."
+        timestamp:
+          type: string
+          format: date-time
+        beforeValue:
+          type: object
+          additionalProperties: true
+          description: "Previous entity state (for update/delete)."
+        afterValue:
+          type: object
+          additionalProperties: true
+          description: "New entity state (for create/update)."
+        justification:
+          type: string
+          description: "Required for certain actions (e.g., overbooking). FR-106, FR-603."
+
+    # ---- Notification (FR-401) ----------------------------
+    Notification:
+      type: object
+      required: [id, patientId, type, channel, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        patientId:
+          type: string
+          format: uuid
+        appointmentId:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+            - appointment-confirmation
+            - appointment-reminder
+            - intake-pending
+            - cancellation
+            - reschedule
+            - waitlist-offer
+            - post-visit-instructions
+        channel:
+          type: string
+          enum: [sms, email]
+        status:
+          type: string
+          enum: [pending, sent, delivered, failed]
+        sentAt:
+          type: string
+          format: date-time
+        deliveryReceiptAt:
+          type: string
+          format: date-time
+
+    # ---- AppointmentStatusUpdate (FR-108) -----------------
+    # Request body for PATCH /appointments/{id}/status
+    AppointmentStatusUpdate:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum:
+            - Confirmed
+            - Checked-in
+            - In-room
+            - Completed
+            - Cancelled
+            - No-show
+        cancellationReasonCode:
+          type: string
+          description: "Required when status=Cancelled."
+        cancellationReasonText:
+          type: string
+
+    # ---- CreateAppointmentRequest (FR-003, FR-106) --------
+    CreateAppointmentRequest:
+      type: object
+      required: [patientId, slotId]
+      properties:
+        patientId:
+          type: string
+          format: uuid
+        slotId:
+          type: string
+          format: uuid
+          description: "slotId from GET /availability response."
+        visitTypeId:
+          type: string
+          format: uuid
+        overbook:
+          type: boolean
+          default: false
+          description: "Staff-only flag to allow overbooking (FR-106)."
+        overbookJustification:
+          type: string
+          description: "Required when overbook=true (FR-106)."
+
+    # ---- OperationalMetrics (FR-501) ----------------------
+    OperationalMetrics:
+      type: object
+      properties:
+        period:
+          type: string
+          description: "Reporting period description (e.g., '2026-01')."
+        noShowRate:
+          type: number
+          format: float
+          description: "Ratio of no-shows to scheduled appointments."
+        lateCancelRate:
+          type: number
+          format: float
+        utilizationRate:
+          type: number
+          format: float
+          description: "Booked slots / available slots."
+        averageLeadTimeDays:
+          type: number
+          format: float
+        fillRate:
+          type: number
+          format: float
+        waitlistConversionRate:
+          type: number
+          format: float
+
+    # ---- ScheduleTemplate (FR-101, FR-602) ----------------
+    ScheduleTemplate:
+      type: object
+      required: [id, providerId, effectiveDate]
+      properties:
+        id:
+          type: string
+          format: uuid
+        providerId:
+          type: string
+          format: uuid
+        locationId:
+          type: string
+          format: uuid
+        effectiveDate:
+          type: string
+          format: date
+          description: "Template takes effect on this date. Does not affect existing published slots (FR-101)."
+        version:
+          type: integer
+        weeklyBlocks:
+          type: array
+          items:
+            $ref: "#/components/schemas/WeeklyBlock"
+
+    # ---- WeeklyBlock --------------------------------------
+    WeeklyBlock:
+      type: object
+      properties:
+        dayOfWeek:
+          type: string
+          enum: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]
+        startTime:
+          type: string
+          description: "HH:MM (24h)."
+        endTime:
+          type: string
+        visitTypeIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: "Visit types allowed in this block; empty means all."
+        bufferMinutesAfter:
+          type: integer
+          default: 0
+          description: "Buffer time appended after each appointment in this block (FR-101)."
+
+    # ---- Encounter (Visit Summary) - referenced in care plan links ---
+    Encounter:
+      type: object
+      required: [id, appointmentId, patientId, providerId]
+      properties:
+        id:
+          type: string
+          format: uuid
+        appointmentId:
+          type: string
+          format: uuid
+        patientId:
+          type: string
+          format: uuid
+        providerId:
+          type: string
+          format: uuid
+        visitDate:
+          type: string
+          format: date
+        summary:
+          type: string
+          description: "Brief clinical note or visit summary (PHI)."
+
+  # ---- Reusable Parameters --------------------------------
+  parameters:
+    PathPatientId:
+      name: patientId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: "OSCS patient UUID."
+
+    PathAppointmentId:
+      name: appointmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    PathCarePlanId:
+      name: carePlanId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    QueryPage:
+      name: page
+      in: query
+      schema:
+        type: integer
+        default: 1
+      description: "Pagination: page number."
+
+    QueryLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        default: 25
+        maximum: 100
+      description: "Pagination: items per page."
+
+  # ---- Reusable Responses ---------------------------------
+  responses:
+    Unauthorized:
+      description: "Authentication required or token expired."
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://api.oscs.abchealthcare.example.com/errors/unauthorized"
+            title: "Unauthorized"
+            status: 401
+            code: "SESSION_EXPIRED"
+
+    Forbidden:
+      description: "Authenticated user lacks permission for this action."
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://api.oscs.abchealthcare.example.com/errors/forbidden"
+            title: "Forbidden"
+            status: 403
+            code: "INSUFFICIENT_PERMISSIONS"
+
+    NotFound:
+      description: "Resource not found."
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    Conflict:
+      description: "Conflict with current state of the resource."
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    UnprocessableEntity:
+      description: "Validation or business rule failure."
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    TooManyRequests:
+      description: "Rate limit exceeded (FR-001 login rate limiting, NFR Security)."
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://api.oscs.abchealthcare.example.com/errors/rate-limited"
+            title: "Too Many Requests"
+            status: 429
+            code: "LOGIN_RATE_LIMITED"
+
+# ============================================================
+# GLOBAL SECURITY REQUIREMENT
+# All endpoints require BearerAuth unless explicitly overridden
+# with security: [] on the individual operation.
+# ============================================================
+security:
+  - BearerAuth: []
+
+# ============================================================
+# PATHS
+# ============================================================
+paths:
+
+  # ==========================================================
+  # A. AUTHENTICATION (FR-001)
+  # Supports patient account creation, OTP verification, login,
+  # and token refresh. Rate-limiting enforced at gateway level.
+  # ==========================================================
+
+  /auth/register:
+    post:
+      tags: [Authentication]
+      summary: "Register a new patient account"
+      description: |
+        Creates an unactivated patient account and triggers OTP dispatch.
+        **PRD Ref:** FR-001
+        **Stories:** US-001
+        **Audit:** Registration attempt (success/failure) is logged.
+        **Rate-limiting:** Brute-force protection at IP and email level.
+      operationId: registerPatient
+      security: []  # No auth required for registration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contactMethod, contactValue, password]
+              properties:
+                contactMethod:
+                  type: string
+                  enum: [email, phone]
+                  description: "Whether the patient is registering with email or phone."
+                contactValue:
+                  type: string
+                  description: "Email address or E.164 phone number."
+                  example: "patient@example.com"
+                password:
+                  type: string
+                  format: password
+                  minLength: 12
+                  description: "Minimum 12 characters. Never logged."
+            example:
+              contactMethod: "email"
+              contactValue: "patient@example.com"
+              password: "Secur3Passw0rd!"
+      responses:
+        "202":
+          description: "Registration accepted; OTP dispatched. Account inactive until OTP verified."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "OTP sent. Please verify to activate your account."
+                  otpExpiresIn:
+                    type: integer
+                    description: "OTP TTL in seconds."
+                    example: 600
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/verify-otp:
+    post:
+      tags: [Authentication]
+      summary: "Verify OTP and activate patient account"
+      description: |
+        Verifies the OTP sent during registration or re-issued on request.
+        Activates the account on success.
+        **PRD Ref:** FR-001
+        **Stories:** US-001
+        **Audit:** OTP verification outcome logged (no raw OTP values stored in logs).
+      operationId: verifyOtp
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contactValue, otp]
+              properties:
+                contactValue:
+                  type: string
+                otp:
+                  type: string
+                  description: "One-time password received via email/SMS. Never logged."
+      responses:
+        "200":
+          description: "Account activated. Patient may now log in."
+        "400":
+          description: "Invalid or expired OTP."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                code: "OTP_EXPIRED"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/login:
+    post:
+      tags: [Authentication]
+      summary: "Authenticate a user and obtain a JWT"
+      description: |
+        Authenticates a patient or staff user. Returns a JWT on success.
+        For staff with MFA enabled, a second step is required.
+        **PRD Ref:** FR-001, NFR Security
+        **Stories:** US-002, US-039
+        **Audit:** All login attempts (success and failure) logged with IP, timestamp, and outcome.
+        **Rate-limiting:** Account locked after N consecutive failures (configurable default: 5).
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contactValue, password]
+              properties:
+                contactValue:
+                  type: string
+                password:
+                  type: string
+                  format: password
+                mfaCode:
+                  type: string
+                  description: "TOTP code. Required for staff accounts with MFA enabled (FR-001, NFR Security)."
+      responses:
+        "200":
+          description: "Login successful; JWT returned."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessToken:
+                    type: string
+                    description: "JWT bearer token. Include in Authorization header for all subsequent requests."
+                  expiresIn:
+                    type: integer
+                    description: "Token validity in seconds."
+                  role:
+                    type: string
+                    description: "User's RBAC role."
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: "MFA code required or invalid."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                code: "MFA_REQUIRED"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  # ==========================================================
+  # B. PATIENT PROFILE (FR-002)
+  # PHI endpoints — all require authentication and RBAC.
+  # Patients can only access their own records.
+  # ==========================================================
+
+  /patients/{patientId}:
+    parameters:
+      - $ref: "#/components/parameters/PathPatientId"
+
+    get:
+      tags: [Patient Profile]
+      summary: "Get patient profile"
+      description: |
+        Returns the authenticated patient's profile, or any patient's profile
+        for authorized staff roles.
+        **PRD Ref:** FR-002
+        **Stories:** US-003
+        **RBAC:** Patient (own record only), Front Desk, Clinician, Nurse, Clinic Manager, System Admin.
+        **Audit:** PHI access logged.
+      operationId: getPatient
+      responses:
+        "200":
+          description: "Patient profile."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Patient"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      tags: [Patient Profile]
+      summary: "Update patient profile"
+      description: |
+        Partial update of patient demographics, contact info, language, and notification preferences.
+        **PRD Ref:** FR-002
+        **Stories:** US-003, US-004
+        **RBAC:** Patient (own record only); Front Desk/Clinician (limited fields).
+        **Audit:** Before/after values logged for all changed fields (FR-603).
+      operationId: updatePatient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: "Partial patient update. Only include fields to change."
+              properties:
+                firstName:
+                  type: string
+                lastName:
+                  type: string
+                address:
+                  $ref: "#/components/schemas/Address"
+                contactPhone:
+                  type: string
+                preferredLanguage:
+                  type: string
+                notificationPreferences:
+                  $ref: "#/components/schemas/NotificationPreferences"
+                emergencyContact:
+                  $ref: "#/components/schemas/EmergencyContact"
+      responses:
+        "200":
+          description: "Updated patient profile."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Patient"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  # ==========================================================
+  # C. AVAILABILITY SEARCH (FR-003, FR-102, FR-107)
+  # Returns eligible available slots. Does not reveal staff-only
+  # visit types to patient callers. Enforces constraints before
+  # returning slots. Response time target: ≤ 2 seconds (NFR).
+  # ==========================================================
+
+  /availability:
+    get:
+      tags: [Scheduling]
+      summary: "Search available appointment slots"
+      description: |
+        Returns eligible available slots matching the search criteria. Enforces:
+        - Visit type booking channel restrictions (staff-only hidden from patients) (FR-103).
+        - Scheduling constraints (FR-107).
+        - Resource conflict prevention (FR-104).
+        - Cross-location search when locationId is omitted (FR-102).
+
+        **PRD Ref:** FR-003, FR-102, FR-103, FR-107, NFR Performance
+        **Stories:** US-005, US-012
+        **Performance:** p95 response time ≤ 2,000ms.
+      operationId: searchAvailability
+      parameters:
+        - name: visitTypeId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: "Required. The visit type to search for."
+        - name: locationId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: "Optional. Omit for cross-location search (FR-102)."
+        - name: providerId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: "Optional provider preference."
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          description: "Start of search window (inclusive)."
+        - name: endDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          description: "End of search window (inclusive). Maximum 90-day window."
+        - $ref: "#/components/parameters/QueryLimit"
+      responses:
+        "200":
+          description: "List of available slots matching the criteria."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slots:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AvailabilitySlot"
+                  totalCount:
+                    type: integer
+              example:
+                slots:
+                  - slotId: "a1b2c3d4-0000-0000-0000-000000000001"
+                    providerId: "prov-0001"
+                    providerDisplayName: "Dr. Jane Smith"
+                    locationId: "loc-0001"
+                    locationName: "North Clinic"
+                    visitTypeId: "vt-annual-wellness"
+                    startDatetime: "2026-10-15T09:00:00-05:00"
+                    endDatetime: "2026-10-15T09:30:00-05:00"
+                totalCount: 1
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  # ==========================================================
+  # D. APPOINTMENTS (FR-003, FR-004, FR-106, FR-107, FR-108)
+  # Core scheduling resource. All state transitions validated
+  # and audited. Double-booking prevented atomically.
+  # ==========================================================
+
+  /appointments:
+    post:
+      tags: [Scheduling]
+      summary: "Book an appointment (instant booking)"
+      description: |
+        Atomically reserves a slot and creates an appointment.
+        Enforces scheduling constraints (FR-107) and resource conflicts (FR-104).
+        Overbook flag available to authorized staff only (FR-106).
+        Triggers confirmation notification (FR-401).
+
+        **PRD Ref:** FR-003, FR-104, FR-106, FR-107
+        **Stories:** US-005, US-017
+        **RBAC:** Patient (self-scheduling visit types only); Staff (all visit types; overbook flag).
+        **Audit:** Booking action logged. Overbook action additionally logs justification.
+      operationId: createAppointment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAppointmentRequest"
+            examples:
+              normalBooking:
+                summary: "Normal patient booking"
+                value:
+                  patientId: "patient-uuid"
+                  slotId: "slot-uuid"
+              overbooking:
+                summary: "Staff overbooking with justification"
+                value:
+                  patientId: "patient-uuid"
+                  slotId: "slot-uuid"
+                  overbook: true
+                  overbookJustification: "Urgent follow-up after ER visit"
+      responses:
+        "201":
+          description: "Appointment created. Confirmation notification dispatched."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: "Slot already booked (race condition) or resource conflict."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                code: "SLOT_UNAVAILABLE"
+        "422":
+          description: "Scheduling constraint failed or overbooking without justification."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                constraintFailed:
+                  value:
+                    code: "CONSTRAINT_NEW_PATIENT"
+                    detail: "This visit type requires an established patient relationship."
+                overbookNoJustification:
+                  value:
+                    code: "OVERBOOK_JUSTIFICATION_REQUIRED"
+
+  /appointments/{appointmentId}:
+    parameters:
+      - $ref: "#/components/parameters/PathAppointmentId"
+
+    get:
+      tags: [Scheduling]
+      summary: "Get appointment details"
+      description: |
+        Returns full appointment record including current state, resources, and consent/form status.
+        **PRD Ref:** FR-108
+        **Stories:** US-019
+        **RBAC:** Patient (own appointments); Staff (any appointment within their scope).
+      operationId: getAppointment
+      responses:
+        "200":
+          description: "Appointment details."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /appointments/{appointmentId}/status:
+    parameters:
+      - $ref: "#/components/parameters/PathAppointmentId"
+
+    patch:
+      tags: [Scheduling]
+      summary: "Transition appointment state"
+      description: |
+        Validates and applies an appointment state transition.
+        Only valid transitions per FR-108 state machine are accepted.
+        All transitions are audit logged (previous state, new state, actor, timestamp).
+
+        **Valid transitions:**
+        Requested → Scheduled | Cancelled
+        Scheduled → Confirmed | Cancelled
+        Confirmed → Checked-in | Cancelled | No-show
+        Checked-in → In-room
+        In-room → Completed
+
+        **PRD Ref:** FR-108
+        **Stories:** US-019, US-022, US-023, US-031
+        **RBAC:** Varies by target state (e.g., In-room/Completed = clinical role only).
+        **Audit:** Every transition logged with before/after states and actor.
+      operationId: updateAppointmentStatus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppointmentStatusUpdate"
+            examples:
+              checkIn:
+                summary: "Front desk check-in"
+                value:
+                  status: "Checked-in"
+              cancel:
+                summary: "Patient cancellation with reason"
+                value:
+                  status: "Cancelled"
+                  cancellationReasonCode: "SCHEDULING_CONFLICT"
+                  cancellationReasonText: "Work conflict arose"
+      responses:
+        "200":
+          description: "State transition applied. Waitlist workflow triggered if applicable."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: "Invalid state transition."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                code: "INVALID_STATE_TRANSITION"
+                detail: "Cannot transition from Scheduled to Completed. Must pass through Confirmed, Checked-in, and In-room."
+
+  /appointments/{appointmentId}/reschedule:
+    parameters:
+      - $ref: "#/components/parameters/PathAppointmentId"
+
+    post:
+      tags: [Scheduling]
+      summary: "Reschedule an appointment"
+      description: |
+        Releases the current slot, reserves the new slot atomically.
+        Enforces the configured reschedule policy window (FR-004).
+        Triggers reschedule notification (FR-401).
+        If waitlist is enabled, releases old slot to waitlist logic (FR-105).
+
+        **PRD Ref:** FR-004, FR-105, FR-401
+        **Stories:** US-007
+        **RBAC:** Patient (own appointments, within policy); Staff (any appointment).
+        **Audit:** Reschedule action logged with old slot, new slot, actor.
+      operationId: rescheduleAppointment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newSlotId]
+              properties:
+                newSlotId:
+                  type: string
+                  format: uuid
+                  description: "slotId from GET /availability."
+      responses:
+        "200":
+          description: "Rescheduled successfully."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          description: "Outside reschedule window or invalid slot."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                code: "RESCHEDULE_WINDOW_EXPIRED"
+
+  /appointments/{appointmentId}/check-in:
+    parameters:
+      - $ref: "#/components/parameters/PathAppointmentId"
+
+    post:
+      tags: [Check-in]
+      summary: "Staff check-in for a patient (front desk)"
+      description: |
+        Transitions appointment to Checked-in state via front desk.
+        Updates the clinic status board in real time.
+        **PRD Ref:** FR-202, FR-203
+        **Stories:** US-022, US-024
+        **RBAC:** Front Desk, Clinic Manager, System Admin.
+        **Audit:** Check-in event logged.
+      operationId: staffCheckIn
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                insuranceCardImageUrl:
+                  type: string
+                  format: uri
+                  description: "Optional uploaded insurance card image URL (FR-202)."
+                idImageUrl:
+                  type: string
+                  format: uri
+                  description: "Optional uploaded ID image URL (FR-202)."
+      responses:
+        "200":
+          description: "Patient checked in."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /appointments/{appointmentId}/self-check-in:
+    parameters:
+      - $ref: "#/components/parameters/PathAppointmentId"
+
+    post:
+      tags: [Check-in]
+      summary: "Patient mobile self check-in"
+      description: |
+        Patient-initiated check-in from mobile device.
+        Enforces time window policy and optional geo-fence (FR-202).
+        **PRD Ref:** FR-202
+        **Stories:** US-023
+        **RBAC:** Patient (own appointment only).
+        **Audit:** Self check-in event logged.
+      operationId: selfCheckIn
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                latitude:
+                  type: number
+                  format: float
+                  description: "Patient's current latitude. Required if geo-fence is enabled for the location."
+                longitude:
+                  type: number
+                  format: float
+      responses:
+        "200":
+          description: "Patient self checked in."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          description: "Check-in window not open or geo-fence violation."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              examples:
+                windowNotOpen:
+                  value:
+                    code: "CHECKIN_WINDOW_NOT_OPEN"
+                geoFence:
+                  value:
+                    code: "CHECKIN_GEOFENCE_VIOLATION"
+
+  # ==========================================================
+  # E. APPOINTMENT REQUESTS (FR-003 request-and-approve mode)
+  # ==========================================================
+
+  /appointment-requests:
+    post:
+      tags: [Scheduling]
+      summary: "Submit an appointment request (request-and-approve mode)"
+      description: |
+        Creates an appointment request when the visit type requires staff approval.
+        Sets status to Requested; routes to staff scheduling queue.
+        **PRD Ref:** FR-003
+        **Stories:** US-006
+        **RBAC:** Patient (self), Front Desk.
+        **Audit:** Request creation logged.
+      operationId: createAppointmentRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patientId, visitTypeId]
+              properties:
+                patientId:
+                  type: string
+                  format: uuid
+                visitTypeId:
+                  type: string
+                  format: uuid
+                preferredProviderIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                preferredLocationIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                preferredDateStart:
+                  type: string
+                  format: date
+                preferredDateEnd:
+                  type: string
+                  format: date
+                reason:
+                  type: string
+      responses:
+        "201":
+          description: "Appointment request created and routed to staff queue."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /appointment-requests/{appointmentId}/approve:
+    parameters:
+      - $ref: "#/components/parameters/PathAppointmentId"
+
+    patch:
+      tags: [Scheduling]
+      summary: "Staff approves an appointment request"
+      description: |
+        Approves a Requested appointment and assigns a slot, transitioning to Scheduled.
+        **PRD Ref:** FR-003
+        **Stories:** US-006
+        **RBAC:** Front Desk, Clinic Manager.
+        **Audit:** Approval logged with actor and assigned slot.
+      operationId: approveAppointmentRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slotId]
+              properties:
+                slotId:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: "Request approved; appointment moved to Scheduled."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  # ==========================================================
+  # F. INTAKE FORMS (FR-005, FR-201, FR-602)
+  # ==========================================================
+
+  /appointments/{appointmentId}/forms:
+    parameters:
+      - $ref: "#/components/parameters/PathAppointmentId"
+
+    get:
+      tags: [Intake]
+      summary: "List intake forms for an appointment"
+      description: |
+        Returns all intake forms assigned to this appointment, including completion status.
+        Staff can view all patients' form statuses (FR-201).
+        **PRD Ref:** FR-005, FR-201
+        **Stories:** US-009, US-021
+        **RBAC:** Patient (own appointment); Front Desk, Clinician, Nurse.
+      operationId: listAppointmentForms
+      responses:
+        "200":
+          description: "List of forms with their completion status."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  forms:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        form:
+                          $ref: "#/components/schemas/IntakeForm"
+                        status:
+                          type: string
+                          enum: [pending, draft, submitted]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /forms/{formId}/responses:
+    post:
+      tags: [Intake]
+      summary: "Submit or save draft of an intake form response"
+      description: |
+        Submit or save a draft intake form response for an appointment.
+        Submitted forms are immutable (FR-005). Triggers reminder suppression (FR-201).
+        E-signature required if form.requiresESignature=true (FR-005).
+
+        **PRD Ref:** FR-005
+        **Stories:** US-009, US-010
+        **RBAC:** Patient (own appointment only).
+        **Audit:** Submission logged. PHI in responses encrypted at rest.
+      operationId: submitFormResponse
+      parameters:
+        - name: formId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [appointmentId, status, responses]
+              properties:
+                appointmentId:
+                  type: string
+                  format: uuid
+                status:
+                  type: string
+                  enum: [draft, submitted]
+                responses:
+                  type: object
+                  additionalProperties: true
+                  description: "Map of fieldId -> response value."
+                signatureData:
+                  type: string
+                  format: byte
+                  description: "Required when form requiresESignature=true and status=submitted."
+      responses:
+        "201":
+          description: "Form response saved."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FormResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: "Form already submitted (immutable)."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                code: "FORM_ALREADY_SUBMITTED"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  # ==========================================================
+  # G. WAITLIST (FR-105)
+  # ==========================================================
+
+  /waitlist:
+    post:
+      tags: [Scheduling]
+      summary: "Enroll patient in waitlist"
+      description: |
+        Adds a patient to the waitlist for a visit type with their preferences.
+        Offers are sent in priority order when slots open (FR-105).
+        **PRD Ref:** FR-105
+        **Stories:** US-015
+        **RBAC:** Patient (own), Front Desk.
+        **Audit:** Waitlist enrollment logged.
+      operationId: enrollWaitlist
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WaitlistEntry"
+      responses:
+        "201":
+          description: "Patient enrolled in waitlist."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WaitlistEntry"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /waitlist/{waitlistEntryId}/accept:
+    post:
+      tags: [Scheduling]
+      summary: "Accept a waitlist slot offer"
+      description: |
+        Patient accepts a time-limited slot offer from the waitlist.
+        Creates an appointment and removes the patient from the waitlist.
+        **PRD Ref:** FR-105
+        **Stories:** US-016
+        **RBAC:** Patient (own entry).
+        **Audit:** Offer acceptance logged.
+      operationId: acceptWaitlistOffer
+      parameters:
+        - name: waitlistEntryId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "201":
+          description: "Offer accepted; appointment created."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Appointment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: "Offer expired."
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                code: "WAITLIST_OFFER_EXPIRED"
+
+  # ==========================================================
+  # H. CARE PLANS (FR-301)
+  # ==========================================================
+
+  /encounters/{encounterId}/care-plans:
+    post:
+      tags: [Care Management]
+      summary: "Create a care plan for an encounter"
+      description: |
+        Creates a care plan linked to a specific encounter (visit).
+        Care plans include goals, interventions, and tasks (FR-301).
+        **PRD Ref:** FR-301
+        **Stories:** US-025
+        **RBAC:** Clinician, Nurse/Care Coordinator (not Front Desk or Patient).
+        **Audit:** Care plan creation logged.
+      operationId: createCarePlan
+      parameters:
+        - name: encounterId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CarePlan"
+      responses:
+        "201":
+          description: "Care plan created."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CarePlan"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /care-plans/{carePlanId}/tasks:
+    parameters:
+      - $ref: "#/components/parameters/PathCarePlanId"
+
+    post:
+      tags: [Care Management]
+      summary: "Add a task to a care plan"
+      description: |
+        Adds a task to a care plan with owner, due date, priority, and status.
+        Overdue tasks escalate per policy (FR-302).
+        **PRD Ref:** FR-302
+        **Stories:** US-026
+        **RBAC:** Clinician, Nurse/Care Coordinator, and Patient (limited fields for own tasks).
+        **Audit:** Task creation logged.
+      operationId: createTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Task"
+      responses:
+        "201":
+          description: "Task created."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ==========================================================
+  # I. MESSAGES (FR-402)
+  # All PHI-bearing messages stored encrypted and audited.
+  # ==========================================================
+
+  /messages:
+    post:
+      tags: [Communications]
+      summary: "Send a portal message"
+      description: |
+        Sends a message from patient to staff or internally between staff.
+        Messages containing PHI stored securely and audited (FR-402).
+        Keyword routing for automated actions (e.g., CANCEL) handled server-side.
+        **PRD Ref:** FR-402
+        **Stories:** US-030
+        **RBAC:** Patient (portal messages to staff); Staff (internal and patient messages).
+        **Audit:** All messages logged; PHI flagged.
+      operationId: sendMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body, channel]
+              properties:
+                patientId:
+                  type: string
+                  format: uuid
+                body:
+                  type: string
+                channel:
+                  type: string
+                  enum: [portal, internal]
+      responses:
+        "201":
+          description: "Message sent."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Message"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ==========================================================
+  # J. CLINIC STATUS BOARD (FR-203)
+  # ==========================================================
+
+  /clinic-status-board:
+    get:
+      tags: [Clinic Operations]
+      summary: "Get real-time clinic status board"
+      description: |
+        Returns all current appointment statuses for the given location/provider/date.
+        Board updates within 5 seconds of state changes (NFR Performance).
+        **PRD Ref:** FR-203, NFR Performance
+        **Stories:** US-024
+        **RBAC:** Front Desk, Clinician, Nurse, Clinic Manager (not Patient).
+      operationId: getClinicStatusBoard
+      parameters:
+        - name: locationId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: providerId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: visitTypeId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: "Current patient flow status for the requested scope."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        appointmentId:
+                          type: string
+                          format: uuid
+                        patientDisplayName:
+                          type: string
+                          description: "First name + last initial only to minimize PHI exposure on shared screens."
+                        status:
+                          type: string
+                          enum: [Scheduled, Confirmed, Checked-in, In-room, Completed, Cancelled, No-show]
+                        waitTimeMinutes:
+                          type: integer
+                        providerName:
+                          type: string
+                        visitTypeName:
+                          type: string
+                        isOverbooked:
+                          type: boolean
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ==========================================================
+  # K. PROVIDER SCHEDULE TEMPLATES (FR-101, FR-602)
+  # ==========================================================
+
+  /providers/{providerId}/schedule-templates:
+    put:
+      tags: [Administration]
+      summary: "Set provider schedule template"
+      description: |
+        Creates or replaces a provider's schedule template with an effective date.
+        Template changes do not affect already-published slots (FR-101).
+        **PRD Ref:** FR-101, FR-602
+        **Stories:** US-011, US-035
+        **RBAC:** System Admin, Clinic Manager.
+        **Audit:** Template change logged with before/after and effective date.
+      operationId: setProviderScheduleTemplate
+      parameters:
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScheduleTemplate"
+      responses:
+        "200":
+          description: "Schedule template saved."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScheduleTemplate"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  # ==========================================================
+  # L. REPORTING (FR-501, FR-502, FR-503)
+  # ==========================================================
+
+  /reports/operational-dashboard:
+    get:
+      tags: [Reporting]
+      summary: "Get operational dashboard metrics"
+      description: |
+        Returns aggregated operational metrics: no-show rate, late cancel rate,
+        utilization, lead time, fill rate, waitlist conversion, staff productivity.
+        **PRD Ref:** FR-501
+        **Stories:** US-031
+        **RBAC:** Clinic Manager, System Admin (full); Front Desk (limited view).
+        Aggregate data only — no individual patient PHI exposed.
+      operationId: getOperationalDashboard
+      parameters:
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: endDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: locationId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: providerId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: visitTypeId
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: "Operational metrics for the specified period."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationalMetrics"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /reports/export:
+    get:
+      tags: [Reporting]
+      summary: "Export report data as CSV"
+      description: |
+        Exports report data as a CSV file. Scoped to the caller's RBAC permissions.
+        Every export action is audit logged (FR-503, FR-603).
+        **PRD Ref:** FR-503
+        **Stories:** US-033
+        **RBAC:** Clinic Manager, System Admin with export permission only.
+        **Audit:** Export action logged with actor, scope, timestamp.
+      operationId: exportReport
+      parameters:
+        - name: reportType
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [no-show-rate, utilization, task-completion, referral-completion]
+        - name: startDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: endDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: "CSV file stream."
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ==========================================================
+  # M. AUDIT LOGS (FR-603)
+  # Read-only. No DELETE or PUT. Immutable.
+  # ==========================================================
+
+  /audit-logs:
+    get:
+      tags: [Administration]
+      summary: "Query audit logs"
+      description: |
+        Queries the immutable audit log. Audit entries include actor, timestamp,
+        entity, action, and before/after values (FR-603).
+        **PRD Ref:** FR-603, NFR Compliance
+        **Stories:** US-036
+        **RBAC:** System Admin, Compliance Officer (assumption: mapped to System Admin role).
+        **Note:** No DELETE or PUT/PATCH methods are exposed — audit logs are immutable.
+      operationId: queryAuditLogs
+      parameters:
+        - name: entityType
+          in: query
+          schema:
+            type: string
+        - name: actorId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: startDate
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: endDate
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryLimit"
+      responses:
+        "200":
+          description: "Paginated audit log entries."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuditLog"
+                  totalCount:
+                    type: integer
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ==========================================================
+  # N. ADMINISTRATION (FR-601, FR-602)
+  # ==========================================================
+
+  /admin/locations:
+    get:
+      tags: [Administration]
+      summary: "List clinic locations"
+      description: |
+        Returns all configured clinic locations with operating hours.
+        **PRD Ref:** FR-601
+        **Stories:** US-034
+        **RBAC:** System Admin, Clinic Manager.
+      operationId: listLocations
+      responses:
+        "200":
+          description: "List of clinic locations."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  locations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Location"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+    post:
+      tags: [Administration]
+      summary: "Create a clinic location"
+      description: |
+        Creates a new clinic location with operating hours and resources.
+        **PRD Ref:** FR-601
+        **Stories:** US-034
+        **RBAC:** System Admin.
+        **Audit:** Location creation logged.
+      operationId: createLocation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Location"
+      responses:
+        "201":
+          description: "Location created."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Location"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /admin/visit-types:
+    get:
+      tags: [Administration]
+      summary: "List visit types"
+      description: |
+        Returns all configured visit types. Patient-facing calls see only
+        patient self-scheduling visit types (FR-103).
+        **PRD Ref:** FR-103, FR-601
+        **Stories:** US-013
+        **RBAC:** System Admin, Clinic Manager (all); Patient (self-scheduling only, filtered).
+      operationId: listVisitTypes
+      responses:
+        "200":
+          description: "List of visit types."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  visitTypes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/VisitType"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      tags: [Administration]
+      summary: "Create a visit type"
+      description: |
+        Creates a new visit type with scheduling rules and constraints.
+        **PRD Ref:** FR-103, FR-601
+        **Stories:** US-013
+        **RBAC:** System Admin.
+        **Audit:** Visit type creation logged.
+      operationId: createVisitType
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VisitType"
+      responses:
+        "201":
+          description: "Visit type created."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VisitType"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ==========================================================
+  # O. NOTIFICATIONS (FR-401)
+  # ==========================================================
+
+  /notifications:
+    get:
+      tags: [Communications]
+      summary: "List notification delivery records"
+      description: |
+        Returns notification dispatch and delivery status records.
+        Useful for operational monitoring and troubleshooting.
+        **PRD Ref:** FR-401
+        **Stories:** US-029
+        **RBAC:** System Admin, Clinic Manager.
+      operationId: listNotifications
+      parameters:
+        - name: patientId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, sent, delivered, failed]
+        - $ref: "#/components/parameters/QueryPage"
+        - $ref: "#/components/parameters/QueryLimit"
+      responses:
+        "200":
+          description: "Notification records."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifications:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Notification"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  # ==========================================================
+  # P. PROVIDERS (FR-101, FR-601)
+  # ==========================================================
+
+  /providers:
+    get:
+      tags: [Administration]
+      summary: "List providers"
+      description: |
+        Returns all providers. Used for scheduling searches and administration.
+        **PRD Ref:** FR-101, FR-601
+        **Stories:** US-011
+        **RBAC:** All authenticated roles (limited fields for patients).
+      operationId: listProviders
+      parameters:
+        - name: locationId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: specialtyId
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: "List of providers."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  providers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Provider"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+# ============================================================
+# TAG DESCRIPTIONS
+# ============================================================
+tags:
+  - name: Authentication
+    description: "Patient and staff authentication. FR-001, NFR Security."
+  - name: Patient Profile
+    description: "Patient demographics and preferences. FR-002. PHI — audit logged."
+  - name: Scheduling
+    description: "Availability search, appointment booking, reschedule, cancel. FR-003, FR-004, FR-105, FR-106, FR-107, FR-108."
+  - name: Check-in
+    description: "Front desk and mobile self check-in. FR-202."
+  - name: Intake
+    description: "Pre-visit intake forms and e-signature consents. FR-005, FR-201."
+  - name: Care Management
+    description: "Care plans and task management. FR-301, FR-302, FR-303."
+  - name: Communications
+    description: "Notifications and two-way messaging. FR-401, FR-402."
+  - name: Clinic Operations
+    description: "Real-time clinic status board. FR-203."
+  - name: Reporting
+    description: "Operational dashboards and data export. FR-501, FR-502, FR-503."
+  - name: Administration
+    description: "Clinic setup, visit types, templates, audit logs. FR-601, FR-602, FR-603."

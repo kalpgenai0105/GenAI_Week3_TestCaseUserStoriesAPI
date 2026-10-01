@@ -1,0 +1,26 @@
+I have attached **ABC_Health_Care_Outpatient_Scheduling_PRD.pdf**, the product requirements document for ABC Health Care's outpatient scheduling system. Using it as the sole source of truth, generate three deliverables: **user stories**, **test cases**, and **API specifications**. Trace every item back to a specific requirement, section, or feature in the PRD so I can verify coverage, and reuse the PRD's own terminology for roles, entities, and workflows.
+
+Where the PRD is silent or ambiguous, do not invent requirements. Make a reasonable assumption, label it clearly as an assumption, and collect all assumptions and open questions in one place so I can confirm them. Because this is healthcare, treat privacy (PHI), authentication and authorization, audit logging, and data retention as first-class concerns wherever the PRD touches them.
+
+**1. User stories**
+- Write each story in standard "As a [role], I want [capability], so that [benefit]" form, with acceptance criteria.
+- Cover every actor and feature the PRD describes.
+- Give each story a unique ID and a reference to its PRD requirement.
+
+**2. Test cases**
+- Derive test cases from the user stories and PRD requirements, covering positive, negative, boundary, and error scenarios, plus security, privacy, and non-functional requirements where the PRD states them.
+- Each test case needs an ID, the linked story or requirement, preconditions, steps, test data, and expected results.
+- Include a traceability matrix mapping requirements to stories to test cases, so coverage gaps are visible.
+
+**3. API specifications**
+- Produce an OpenAPI 3.x specification in YAML covering every endpoint the PRD's features imply.
+- Define request and response schemas, parameters, status codes including error responses, authentication and authorization schemes, and example payloads.
+- Add detailed descriptions and comments throughout the specification explaining the purpose of each endpoint, field, and design decision, and tie each endpoint to the user stories it supports.
+
+**Code and comments**
+I want detailed comments on all code. Add comments explaining the purpose, inputs, outputs, and reasoning behind every endpoint definition, schema, and code block. If you write any supporting code (for example, a script that validates the spec or scaffolds tests), comment it thoroughly, including the why behind non-obvious choices.
+
+**Model**
+I intend to run this with the Google Gemini model I have access to. If you are not that model, write everything so it can be used with Gemini as-is, and do not reference tools or features that are unavailable to it.
+
+Organize the output into clearly separated sections (user stories, test cases, API spec, assumptions and open questions) so each can be copied out independently. Produce the complete output in this one response, without stopping to ask me questions.
